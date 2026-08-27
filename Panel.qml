@@ -333,6 +333,7 @@ Panel {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             text: root.hostWidget && root.hostWidget.barIcon
               ? root.hostWidget.barIcon
               : Model.defaultIcon()
@@ -347,6 +348,7 @@ Panel {
             spacing: Style.space(1)
 
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: "Screenshot Manager"
               color: root.contentForeground
@@ -356,6 +358,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               Layout.fillWidth: true
               text: root.statusText || "List, preview, copy, and delete screenshots"
               color: root.contentDim
@@ -428,6 +431,7 @@ Panel {
           width: parent.width
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: "SCREENSHOTS"
             color: root.contentDim
@@ -437,6 +441,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.busy
             text: "Working…"
             color: root.contentDim
@@ -446,6 +451,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: !root.busy && root.visibleScreenshots.length === 0
           width: parent.width
           text: root.filterText
@@ -504,9 +510,12 @@ Panel {
 
                 Image {
                   anchors.fill: parent
-                  source: screenshotRow.modelData.path ? "file://" + screenshotRow.modelData.path : ""
+                  source: screenshotRow.modelData.previewPath ? "file://" + screenshotRow.modelData.previewPath : ""
+                  sourceSize.width: Math.round(Style.space(168))
+                  sourceSize.height: Math.round(Style.space(96))
                   fillMode: Image.PreserveAspectCrop
                   smooth: true
+                  asynchronous: true
                 }
               }
 
@@ -515,6 +524,7 @@ Panel {
                 spacing: Style.space(1)
 
                 Text {
+                  textFormat: Text.PlainText
                   Layout.fillWidth: true
                   text: screenshotRow.modelData.name
                   color: root.contentForeground
@@ -524,6 +534,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   Layout.fillWidth: true
                   text: Model.screenshotMeta(screenshotRow.modelData)
                   color: root.contentDim
@@ -568,6 +579,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: "Screenshots are copied to the clipboard as PNG · Trashed files stay in the desktop trash."
           color: root.contentDim

@@ -20,9 +20,12 @@ function normalizeScreenshot(value) {
   var source = value || {}
   return {
     path: cleanText(source.path),
+    previewPath: cleanText(source.previewPath),
     name: cleanText(source.name),
     size: Number(source.size || 0),
     humanSize: cleanText(source.humanSize) || "",
+    width: Number(source.width || 0),
+    height: Number(source.height || 0),
     mtimeIso: cleanText(source.mtimeIso)
   }
 }

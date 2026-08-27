@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Helper for the Omarchy Screenshot Manager plugin.
-
-Lists screenshots taken by `omarchy capture screenshot`, moves them to the
-desktop trash, and copies them to the clipboard as PNG data. Runs
-unprivileged — screenshots are user-owned files in the Pictures directory.
-"""
+"""Bounded, symlink-safe helper for the Omarchy Screenshot Manager plugin."""
 
 from __future__ import annotations
 
 import argparse
-import glob
+import contextlib
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Sequence
+from typing import Iterator, Sequence
 
 
 class ScreenshotError(RuntimeError):
@@ -25,26 +25,62 @@ class ScreenshotError(RuntimeError):
 
 
 SCREENSHOT_NAME_RE = re.compile(r"^screenshot-.*\.png$", re.IGNORECASE)
+CACHE_NAME_RE = re.compile(r"^[0-9a-f]{64}\.png$")
 MAX_LIST_COUNT = 200
+MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_IMAGE_WIDTH = 16_384
+MAX_IMAGE_HEIGHT = 16_384
+MAX_IMAGE_PIXELS = 40_000_000
+PNG_HEADER_BYTES = 24
+COPY_CHUNK_BYTES = 64 * 1024
+MAX_USER_DIRS_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class OpenScreenshot:
+    fd: int
+    path: str
+    name: str
+    size: int
+    mtime_ns: int
+    device: int
+    inode: int
+    width: int
+    height: int
 
 
 def parse_user_dirs() -> dict[str, str]:
     values: dict[str, str] = {}
     path = os.path.expanduser("~/.config/user-dirs.dirs")
     try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, raw = line.partition("=")
-                key = key.strip()
-                raw = raw.strip().strip('"')
-                if raw.startswith("$HOME"):
-                    raw = os.path.expanduser("~") + raw[len("$HOME"):]
-                values[key] = raw
+        fd = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_USER_DIRS_BYTES:
+            return values
+        content = os.read(fd, MAX_USER_DIRS_BYTES + 1)
     except OSError:
-        pass
+        return values
+    finally:
+        if "fd" in locals():
+            os.close(fd)
+    if len(content) > MAX_USER_DIRS_BYTES:
+        return values
+    for line in content.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key = key.strip()
+        raw = raw.strip().strip('"')
+        if raw.startswith("$HOME"):
+            raw = os.path.expanduser("~") + raw[len("$HOME"):]
+        values[key] = raw
     return values
 
 
@@ -67,75 +103,314 @@ def human_size(size: int) -> str:
     return f"{size}B"
 
 
-def list_screenshots() -> dict[str, object]:
-    directory = screenshots_dir()
-    matches = []
-    for entry in glob.glob(os.path.join(directory, "screenshot-*.png")):
-        if not SCREENSHOT_NAME_RE.match(os.path.basename(entry)):
-            continue
-        try:
-            stat = os.stat(entry)
-        except OSError:
-            continue
-        matches.append(
-            {
-                "path": entry,
-                "name": os.path.basename(entry),
-                "size": stat.st_size,
-                "humanSize": human_size(stat.st_size),
-                "mtimeIso": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
-            }
-        )
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0)
 
-    matches.sort(key=lambda item: item["mtimeIso"], reverse=True)
-    total = len(matches)
-    return {
-        "dir": directory,
-        "dirName": os.path.basename(directory),
-        "count": min(total, MAX_LIST_COUNT),
-        "total": total,
-        "screenshots": matches[:MAX_LIST_COUNT],
-    }
+
+def _file_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _open_directory(directory: str) -> int:
+    try:
+        return os.open(directory, _directory_flags())
+    except OSError as error:
+        raise ScreenshotError("Could not open screenshots directory") from error
+
+
+def _png_dimensions(fd: int) -> tuple[int, int]:
+    try:
+        header = os.pread(fd, PNG_HEADER_BYTES, 0)
+    except OSError as error:
+        raise ScreenshotError("Could not read screenshot header") from error
+    if (
+        len(header) != PNG_HEADER_BYTES
+        or header[:8] != b"\x89PNG\r\n\x1a\n"
+        or header[8:12] != b"\x00\x00\x00\r"
+        or header[12:16] != b"IHDR"
+    ):
+        raise ScreenshotError("Screenshot is not a valid PNG image")
+    width, height = struct.unpack(">II", header[16:24])
+    if (
+        width == 0
+        or height == 0
+        or width > MAX_IMAGE_WIDTH
+        or height > MAX_IMAGE_HEIGHT
+        or width * height > MAX_IMAGE_PIXELS
+    ):
+        raise ScreenshotError("Screenshot dimensions exceed the safe preview limit")
+    return width, height
+
+
+def _open_screenshot_at(directory_fd: int, directory: str, name: str) -> OpenScreenshot:
+    if not SCREENSHOT_NAME_RE.fullmatch(name) or os.path.basename(name) != name:
+        raise ScreenshotError("Only screenshots taken by omarchy capture can be managed here")
+    try:
+        name.encode("utf-8")
+        fd = os.open(name, _file_flags(), dir_fd=directory_fd)
+    except (OSError, UnicodeError) as error:
+        raise ScreenshotError("Could not safely open screenshot") from error
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ScreenshotError("Screenshot must be a regular file")
+        if metadata.st_size > MAX_FILE_BYTES:
+            raise ScreenshotError("Screenshot exceeds the 32 MB size limit")
+        if metadata.st_size < PNG_HEADER_BYTES:
+            raise ScreenshotError("Screenshot is not a valid PNG image")
+        width, height = _png_dimensions(fd)
+        return OpenScreenshot(
+            fd=fd,
+            path=os.path.join(directory, name),
+            name=name,
+            size=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            width=width,
+            height=height,
+        )
+    except Exception:
+        os.close(fd)
+        raise
+
+
+@contextlib.contextmanager
+def open_screenshot(path: str) -> Iterator[OpenScreenshot]:
+    directory = screenshots_dir()
+    if not path or not os.path.isabs(path) or os.path.dirname(path) != directory:
+        raise ScreenshotError("Screenshot path must be directly inside the screenshots directory")
+    directory_fd = _open_directory(directory)
+    screenshot: OpenScreenshot | None = None
+    try:
+        screenshot = _open_screenshot_at(directory_fd, directory, os.path.basename(path))
+        yield screenshot
+    finally:
+        if screenshot is not None:
+            os.close(screenshot.fd)
+        os.close(directory_fd)
 
 
 def validate_screenshot_path(path: str) -> str:
-    if not path or not os.path.isabs(path):
-        raise ScreenshotError("Screenshot path must be absolute")
-    if not SCREENSHOT_NAME_RE.match(os.path.basename(path)):
-        raise ScreenshotError("Only screenshots taken by omarchy capture can be managed here")
-    if not os.path.isfile(path):
-        raise ScreenshotError("Screenshot file does not exist")
+    with open_screenshot(path) as screenshot:
+        return screenshot.path
 
-    directory = screenshots_dir()
+
+def _runtime_directory() -> str:
+    candidates = [os.environ.get("XDG_RUNTIME_DIR"), f"/run/user/{os.getuid()}"]
+    for candidate in candidates:
+        if not candidate or not os.path.isabs(candidate):
+            continue
+        try:
+            metadata = os.stat(candidate, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid():
+            return candidate
+    return tempfile.gettempdir()
+
+
+def _open_cache_directory() -> tuple[int, str]:
+    path = os.path.join(_runtime_directory(), f"omarchy-screenshot-manager-{os.getuid()}")
     try:
-        real_path = os.path.realpath(path)
-        real_dir = os.path.realpath(directory)
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
     except OSError as error:
-        raise ScreenshotError("Could not resolve screenshot path") from error
-    if real_path != real_dir and not real_path.startswith(real_dir + os.sep):
-        raise ScreenshotError("Screenshot is outside the screenshots directory")
-    return real_path
+        raise ScreenshotError("Could not create the preview cache") from error
+    fd: int | None = None
+    try:
+        fd = os.open(path, _directory_flags() | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(fd)
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ScreenshotError("Preview cache permissions are unsafe")
+        return fd, path
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        raise
 
 
-def run_checked(
-    arguments: Sequence[str],
-    *,
-    input_bytes: bytes | None = None,
-    quiet: bool = False,
-) -> None:
-    # `quiet` is required for wl-copy: it forks a background daemon that
-    # owns the Wayland selection, and if we give it pipes the daemon inherits
-    # them, so subprocess.run blocks forever waiting for EOF. Redirecting to
-    # devnull lets the parent return while the daemon keeps serving the
-    # clipboard.
+def _cache_key(screenshot: OpenScreenshot) -> str:
+    identity = "\0".join(
+        (
+            screenshot.path,
+            str(screenshot.device),
+            str(screenshot.inode),
+            str(screenshot.size),
+            str(screenshot.mtime_ns),
+            str(screenshot.width),
+            str(screenshot.height),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".png"
+
+
+def _same_file(screenshot: OpenScreenshot, metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_dev == screenshot.device
+        and metadata.st_ino == screenshot.inode
+        and metadata.st_size == screenshot.size
+        and metadata.st_mtime_ns == screenshot.mtime_ns
+    )
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise ScreenshotError("Could not write preview cache")
+        view = view[written:]
+
+
+def _validate_cached_file(cache_fd: int, name: str, expected: OpenScreenshot) -> bool:
+    try:
+        fd = os.open(name, _file_flags(), dir_fd=cache_fd)
+    except OSError:
+        return False
+    try:
+        metadata = os.fstat(fd)
+        return (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_size == expected.size
+            and metadata.st_size <= MAX_FILE_BYTES
+            and _png_dimensions(fd) == (expected.width, expected.height)
+        )
+    except (OSError, ScreenshotError):
+        return False
+    finally:
+        os.close(fd)
+
+
+def _materialize_preview(cache_fd: int, cache_path: str, screenshot: OpenScreenshot) -> str:
+    cache_name = _cache_key(screenshot)
+    if _validate_cached_file(cache_fd, cache_name, screenshot):
+        return os.path.join(cache_path, cache_name)
+
+    temporary_name = f".{cache_name}.{os.getpid()}.tmp"
+    temporary_fd: int | None = None
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=cache_fd,
+        )
+        os.lseek(screenshot.fd, 0, os.SEEK_SET)
+        copied = 0
+        while True:
+            chunk = os.read(screenshot.fd, COPY_CHUNK_BYTES)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > MAX_FILE_BYTES:
+                raise ScreenshotError("Screenshot changed while it was being read")
+            _write_all(temporary_fd, chunk)
+        if copied != screenshot.size or not _same_file(screenshot, os.fstat(screenshot.fd)):
+            raise ScreenshotError("Screenshot changed while it was being read")
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        if not _validate_cached_file(cache_fd, temporary_name, screenshot):
+            raise ScreenshotError("Screenshot changed while it was being read")
+        os.replace(temporary_name, cache_name, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
+    except Exception:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=cache_fd)
+        except OSError:
+            pass
+        raise
+    return os.path.join(cache_path, cache_name)
+
+
+def _cleanup_cache(cache_fd: int, keep: set[str]) -> None:
+    try:
+        names = os.listdir(cache_fd)
+    except OSError:
+        return
+    for name in names:
+        if CACHE_NAME_RE.fullmatch(name) and name not in keep:
+            try:
+                os.unlink(name, dir_fd=cache_fd)
+            except OSError:
+                pass
+
+
+def list_screenshots() -> dict[str, object]:
+    directory = screenshots_dir()
+    directory_fd = _open_directory(directory)
+    candidates: list[tuple[int, str]] = []
+    try:
+        for name in os.listdir(directory_fd):
+            if not SCREENSHOT_NAME_RE.fullmatch(name):
+                continue
+            try:
+                screenshot = _open_screenshot_at(directory_fd, directory, name)
+            except ScreenshotError:
+                continue
+            candidates.append((screenshot.mtime_ns, name))
+            os.close(screenshot.fd)
+
+        candidates.sort(reverse=True)
+        total = len(candidates)
+        cache_fd, cache_path = _open_cache_directory()
+        matches: list[dict[str, object]] = []
+        keep: set[str] = set()
+        try:
+            for _, name in candidates:
+                if len(matches) >= MAX_LIST_COUNT:
+                    break
+                screenshot = None
+                try:
+                    screenshot = _open_screenshot_at(directory_fd, directory, name)
+                    preview_path = _materialize_preview(cache_fd, cache_path, screenshot)
+                    item = {
+                        "path": screenshot.path,
+                        "previewPath": preview_path,
+                        "name": screenshot.name,
+                        "size": screenshot.size,
+                        "humanSize": human_size(screenshot.size),
+                        "width": screenshot.width,
+                        "height": screenshot.height,
+                        "mtimeIso": datetime.fromtimestamp(
+                            screenshot.mtime_ns / 1_000_000_000
+                        ).astimezone().isoformat(timespec="seconds"),
+                    }
+                except ScreenshotError:
+                    continue
+                finally:
+                    if screenshot is not None:
+                        os.close(screenshot.fd)
+                keep.add(os.path.basename(preview_path))
+                matches.append(item)
+            _cleanup_cache(cache_fd, keep)
+        finally:
+            os.close(cache_fd)
+    finally:
+        os.close(directory_fd)
+
+    return {
+        "dir": directory,
+        "dirName": os.path.basename(directory),
+        "count": len(matches),
+        "total": total,
+        "screenshots": matches,
+    }
+
+
+def run_checked(arguments: Sequence[str], *, quiet: bool = False) -> None:
     stdout = subprocess.DEVNULL if quiet else subprocess.PIPE
     stderr = subprocess.DEVNULL if quiet else subprocess.PIPE
-    result = subprocess.run(
-        list(arguments),
-        input=input_bytes,
-        stdout=stdout,
-        stderr=stderr,
-    )
+    result = subprocess.run(list(arguments), stdout=stdout, stderr=stderr)
     if result.returncode != 0:
         detail = ""
         if not quiet and result.stderr is not None:
@@ -144,40 +419,76 @@ def run_checked(
 
 
 def trash(path: str) -> dict[str, object]:
-    real_path = validate_screenshot_path(path)
+    validated_path = validate_screenshot_path(path)
     if shutil.which("gio") is None:
         raise ScreenshotError("gio is not installed")
-    run_checked(["gio", "trash", real_path])
-    return {"trashed": {"path": real_path}}
+    run_checked(["gio", "trash", validated_path])
+    return {"trashed": {"path": validated_path}}
 
 
 def clear_screenshots() -> dict[str, object]:
     if shutil.which("gio") is None:
         raise ScreenshotError("gio is not installed")
+    directory = screenshots_dir()
+    directory_fd = _open_directory(directory)
+    try:
+        names = os.listdir(directory_fd)
+    finally:
+        os.close(directory_fd)
     trashed: list[str] = []
-    for entry in glob.glob(os.path.join(screenshots_dir(), "screenshot-*.png")):
-        if not SCREENSHOT_NAME_RE.match(os.path.basename(entry)):
+    for name in names:
+        if not SCREENSHOT_NAME_RE.fullmatch(name):
             continue
+        path = os.path.join(directory, name)
         try:
-            real_path = validate_screenshot_path(entry)
+            validated_path = validate_screenshot_path(path)
         except ScreenshotError:
             continue
-        run_checked(["gio", "trash", real_path])
-        trashed.append(real_path)
+        run_checked(["gio", "trash", validated_path])
+        trashed.append(validated_path)
     return {"trashed": trashed}
 
 
+def _stream_to_clipboard(screenshot: OpenScreenshot) -> None:
+    process = subprocess.Popen(
+        ["wl-copy", "-t", "image/png"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        if process.stdin is None:
+            raise ScreenshotError("Could not open clipboard input")
+        os.lseek(screenshot.fd, 0, os.SEEK_SET)
+        remaining = screenshot.size
+        while remaining:
+            chunk = os.read(screenshot.fd, min(COPY_CHUNK_BYTES, remaining))
+            if not chunk:
+                raise ScreenshotError("Screenshot changed while it was being read")
+            process.stdin.write(chunk)
+            remaining -= len(chunk)
+        if os.read(screenshot.fd, 1) or not _same_file(screenshot, os.fstat(screenshot.fd)):
+            raise ScreenshotError("Screenshot changed while it was being read")
+        process.stdin.close()
+        if process.wait() != 0:
+            raise ScreenshotError("command failed")
+    except (OSError, BrokenPipeError) as error:
+        raise ScreenshotError("Could not copy screenshot") from error
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process.poll() is None:
+            process.terminate()
+        process.wait()
+
+
 def copy(path: str) -> dict[str, object]:
-    real_path = validate_screenshot_path(path)
     if shutil.which("wl-copy") is None:
         raise ScreenshotError("wl-copy is not installed")
-    try:
-        with open(real_path, "rb") as handle:
-            content = handle.read()
-    except OSError as error:
-        raise ScreenshotError("Could not read screenshot") from error
-    run_checked(["wl-copy", "-t", "image/png"], input_bytes=content, quiet=True)
-    return {"copied": {"path": real_path}}
+    with open_screenshot(path) as screenshot:
+        _stream_to_clipboard(screenshot)
+        copied_path = screenshot.path
+    return {"copied": {"path": copied_path}}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -186,12 +497,9 @@ def parser() -> argparse.ArgumentParser:
     )
     subcommands = command_parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("list")
-
     subcommands.add_parser("clear")
-
     trash_parser = subcommands.add_parser("trash")
     trash_parser.add_argument("path")
-
     copy_parser = subcommands.add_parser("copy")
     copy_parser.add_argument("path")
     return command_parser
@@ -207,7 +515,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = trash(args.path)
     else:
         result = copy(args.path)
-
     json.dump(result, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write("\n")
     return 0

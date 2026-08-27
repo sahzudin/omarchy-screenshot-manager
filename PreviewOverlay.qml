@@ -20,9 +20,8 @@ PanelWindow {
   readonly property var currentScreenshot: root.currentIndex >= 0 && root.currentIndex < root.screenshots.length
     ? root.screenshots[root.currentIndex]
     : null
-  readonly property string currentPath: currentScreenshot ? currentScreenshot.path : ""
-  readonly property int previewWidth: previewImage.sourceSize.width
-  readonly property int previewHeight: previewImage.sourceSize.height
+  readonly property int previewWidth: currentScreenshot ? currentScreenshot.width : 0
+  readonly property int previewHeight: currentScreenshot ? currentScreenshot.height : 0
   readonly property color foreground: Color.foreground
   readonly property color dim: Qt.darker(Color.foreground, 1.5)
   readonly property color scrim: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.82)
@@ -98,9 +97,14 @@ PanelWindow {
             id: previewImage
             anchors.fill: parent
             anchors.margins: Style.space(8)
-            source: root.currentPath ? "file://" + root.currentPath : ""
+            source: root.currentScreenshot && root.currentScreenshot.previewPath
+              ? "file://" + root.currentScreenshot.previewPath
+              : ""
+            sourceSize.width: Math.min(3840, Math.max(1, Math.round(width)))
+            sourceSize.height: Math.min(2160, Math.max(1, Math.round(height)))
             fillMode: Image.PreserveAspectFit
             smooth: true
+            asynchronous: true
           }
         }
 
@@ -109,6 +113,7 @@ PanelWindow {
           spacing: Style.spacing.lg
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: currentScreenshot ? currentScreenshot.name : ""
             color: root.foreground
@@ -118,6 +123,7 @@ PanelWindow {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: currentScreenshot
               ? (root.previewWidth > 0
                   ? root.previewWidth + "×" + root.previewHeight + "  ·  "

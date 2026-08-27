@@ -20,7 +20,10 @@ deleting screenshots taken with `omarchy capture screenshot`.
 - Supports shell IPC (`open`, `close`, `toggle`, `show`, `hide`, and `refresh`).
 
 No privileges are required: screenshots are ordinary user files. Paths are
-validated against the screenshots directory, arguments are passed as arrays,
+opened relative to the screenshots directory without following symlinks.
+Non-regular files, files over 32 MB, and PNGs over 16,384 pixels on either axis
+or 40 megapixels are ignored. Preview images come from bounded private cache
+copies, clipboard data is streamed in chunks, arguments are passed as arrays,
 and no shell command strings are evaluated.
 
 ## Requirements

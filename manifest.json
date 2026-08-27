@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.sahzudin.omarchy-screenshot-manager",
   "name": "Omarchy Screenshot Manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Sahzudin Mahmic",
   "license": "MIT",
   "description": "Browse, preview, copy, and delete screenshots taken with omarchy capture.",

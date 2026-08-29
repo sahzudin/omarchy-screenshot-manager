@@ -26,13 +26,16 @@ class ScreenshotCtlTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.pictures = self.root / "Pictures<b>"
         self.runtime = self.root / "runtime"
+        self.state = self.root / "state"
         self.pictures.mkdir(mode=0o700)
         self.runtime.mkdir(mode=0o700)
+        self.state.mkdir(mode=0o700)
         self.environment = mock.patch.dict(
             os.environ,
             {
                 "OMARCHY_SCREENSHOT_DIR": str(self.pictures),
                 "XDG_RUNTIME_DIR": str(self.runtime),
+                "XDG_STATE_HOME": str(self.state),
             },
             clear=False,
         )
@@ -104,6 +107,62 @@ class ScreenshotCtlTests(unittest.TestCase):
         self.assertEqual(result["copied"]["path"], str(path))
         self.assertLessEqual(sink.largest_write, screenshotctl.COPY_CHUNK_BYTES)
         self.assertEqual(bytes(sink.data), path.read_bytes())
+
+    def age(self, path: Path, seconds: int) -> None:
+        stamp = path.stat().st_mtime + seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_status_starts_the_marker_at_the_newest_existing_screenshot(self) -> None:
+        self.write_png("screenshot-old.png")
+
+        state = screenshotctl.status()
+
+        self.assertEqual(state["total"], 1)
+        self.assertEqual(state["newCount"], 0)
+        self.assertEqual(state["seenStamp"], state["latestStamp"])
+
+    def test_status_counts_only_screenshots_newer_than_the_marker(self) -> None:
+        self.write_png("screenshot-old.png")
+        screenshotctl.status()
+        self.age(self.write_png("screenshot-new.png"), 60)
+
+        state = screenshotctl.status()
+
+        self.assertEqual(state["newCount"], 1)
+        self.assertEqual(state["latest"], str(self.pictures / "screenshot-new.png"))
+        self.assertGreater(state["latestStamp"], state["seenStamp"])
+
+    def test_seen_clears_the_count_and_survives_a_restart(self) -> None:
+        self.write_png("screenshot-old.png")
+        screenshotctl.status()
+        self.age(self.write_png("screenshot-new.png"), 60)
+
+        marked = screenshotctl.status(mark_seen=True)
+
+        self.assertEqual(marked["newCount"], 0)
+        self.assertEqual(marked["seenStamp"], marked["latestStamp"])
+        self.assertEqual(screenshotctl.status()["newCount"], 0)
+        marker = self.state / "omarchy" / "screenshot-manager" / "seen"
+        self.assertEqual(marker.read_text(), str(marked["latestStamp"]))
+        self.assertEqual(marker.stat().st_mode & 0o077, 0)
+
+    def test_status_ignores_symlinks_pipes_and_foreign_names(self) -> None:
+        target = self.write_png("target.png")
+        os.symlink(target, self.pictures / "screenshot-link.png")
+        os.mkfifo(self.pictures / "screenshot-pipe.png", 0o600)
+
+        state = screenshotctl.status()
+
+        self.assertEqual(state["total"], 0)
+        self.assertEqual(state["latest"], "")
+
+    def test_status_survives_an_unreadable_marker(self) -> None:
+        self.write_png("screenshot-old.png")
+        marker = self.state / "omarchy" / "screenshot-manager"
+        marker.mkdir(mode=0o700, parents=True)
+        (marker / "seen").write_text("not a number")
+
+        self.assertEqual(screenshotctl.status()["newCount"], 0)
 
     def test_all_qml_text_elements_force_plain_text(self) -> None:
         for filename in ("Panel.qml", "PreviewOverlay.qml"):

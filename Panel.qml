@@ -36,10 +36,7 @@ Panel {
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool busy: listProcess.running || trashProcess.running || copyProcess.running || clearProcess.running
   readonly property bool previewOpen: preview ? preview.open : false
-  readonly property string helperPath: {
-    var url = decodeURIComponent(String(Qt.resolvedUrl("screenshotctl.py")))
-    return url.indexOf("file://") === 0 ? url.substring(7) : url
-  }
+  readonly property string helperPath: Model.scriptPath(Qt.resolvedUrl("screenshotctl.py"))
 
   function helperCommand(args) {
     return [root.helperPath].concat(args || [])

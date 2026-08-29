@@ -34,6 +34,8 @@ MAX_IMAGE_PIXELS = 40_000_000
 PNG_HEADER_BYTES = 24
 COPY_CHUNK_BYTES = 64 * 1024
 MAX_USER_DIRS_BYTES = 64 * 1024
+SEEN_FILE_NAME = "seen"
+MAX_SEEN_BYTES = 32
 
 
 @dataclass(frozen=True)
@@ -407,6 +409,106 @@ def list_screenshots() -> dict[str, object]:
     }
 
 
+def _state_directory() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(os.path.abspath(os.path.expanduser(base)), "omarchy", "screenshot-manager")
+
+
+def _read_seen() -> int:
+    """Milliseconds of the newest screenshot the user has already been shown."""
+    try:
+        fd = os.open(os.path.join(_state_directory(), SEEN_FILE_NAME), _file_flags())
+    except OSError:
+        return 0
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_SEEN_BYTES:
+            return 0
+        raw = os.read(fd, MAX_SEEN_BYTES)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+    try:
+        return max(0, int(raw.decode("ascii").strip() or "0"))
+    except (UnicodeDecodeError, ValueError):
+        return 0
+
+
+def _write_seen(stamp_ms: int) -> int:
+    value = max(0, int(stamp_ms))
+    directory = _state_directory()
+    path = os.path.join(directory, SEEN_FILE_NAME)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            _write_all(fd, str(value).encode("ascii"))
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+    except OSError as error:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise ScreenshotError("Could not record the seen marker") from error
+    return value
+
+
+def _screenshot_stamps() -> tuple[str, list[tuple[int, str]]]:
+    """(directory, [(mtime_ms, name)]) newest first, cheap enough to poll.
+
+    Deliberately lighter than `list`: names and stat only, no PNG headers read
+    and no preview cache touched, because the bar asks this question on a timer
+    and the answer is one number.
+    """
+    directory = screenshots_dir()
+    directory_fd = _open_directory(directory)
+    stamps: list[tuple[int, str]] = []
+    try:
+        for name in os.listdir(directory_fd):
+            if not SCREENSHOT_NAME_RE.fullmatch(name):
+                continue
+            try:
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_FILE_BYTES:
+                continue
+            stamps.append((metadata.st_mtime_ns // 1_000_000, name))
+    finally:
+        os.close(directory_fd)
+    stamps.sort(reverse=True)
+    return directory, stamps
+
+
+def status(*, mark_seen: bool = False) -> dict[str, object]:
+    directory, stamps = _screenshot_stamps()
+    latest_ms = stamps[0][0] if stamps else 0
+    latest_name = stamps[0][1] if stamps else ""
+
+    seen_ms = _read_seen()
+    # Nothing on disk when the widget is first enabled is "new": it all predates
+    # the marker existing. Starting the marker at zero would light the bar up on
+    # first run for a directory the user has never once thought of as unread.
+    if seen_ms <= 0 or mark_seen:
+        seen_ms = _write_seen(latest_ms)
+
+    return {
+        "dir": directory,
+        "dirName": os.path.basename(directory),
+        "total": len(stamps),
+        "latest": os.path.join(directory, latest_name) if latest_name else "",
+        "latestStamp": latest_ms,
+        "seenStamp": seen_ms,
+        "newCount": sum(1 for stamp_ms, _ in stamps if stamp_ms > seen_ms),
+    }
+
+
 def run_checked(arguments: Sequence[str], *, quiet: bool = False) -> None:
     stdout = subprocess.DEVNULL if quiet else subprocess.PIPE
     stderr = subprocess.DEVNULL if quiet else subprocess.PIPE
@@ -493,10 +595,12 @@ def copy(path: str) -> dict[str, object]:
 
 def parser() -> argparse.ArgumentParser:
     command_parser = argparse.ArgumentParser(
-        description="List, trash, and copy Omarchy screenshots"
+        description="List, poll, trash, and copy Omarchy screenshots"
     )
     subcommands = command_parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("list")
+    subcommands.add_parser("status")
+    subcommands.add_parser("seen")
     subcommands.add_parser("clear")
     trash_parser = subcommands.add_parser("trash")
     trash_parser.add_argument("path")
@@ -509,6 +613,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "list":
         result = list_screenshots()
+    elif args.command == "status":
+        result = status()
+    elif args.command == "seen":
+        result = status(mark_seen=True)
     elif args.command == "clear":
         result = clear_screenshots()
     elif args.command == "trash":

@@ -169,7 +169,7 @@ Panel {
     if (root.busy) return
     resetTrashConfirmation()
     root.statusText = "Launching screenshot flow…"
-    Quickshell.execDetached("omarchy capture screenshot")
+    Quickshell.execDetached(["omarchy", "capture", "screenshot"])
     takeRefreshTimer.restart()
   }
 

@@ -414,25 +414,33 @@ def _state_directory() -> str:
     return os.path.join(os.path.abspath(os.path.expanduser(base)), "omarchy", "screenshot-manager")
 
 
-def _read_seen() -> int:
-    """Milliseconds of the newest screenshot the user has already been shown."""
+def _read_seen() -> int | None:
+    """Milliseconds of the newest screenshot the user has already been shown.
+
+    None means there is no usable marker — absent, unreadable, or corrupt.
+    Zero is a real answer, and a different one: it is what an empty screenshots
+    directory records, and it has to survive the first screenshot landing in
+    that directory. Folding the two together re-seeds the marker on the very
+    screenshot it should be announcing.
+    """
     try:
         fd = os.open(os.path.join(_state_directory(), SEEN_FILE_NAME), _file_flags())
     except OSError:
-        return 0
+        return None
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_SEEN_BYTES:
-            return 0
+            return None
         raw = os.read(fd, MAX_SEEN_BYTES)
     except OSError:
-        return 0
+        return None
     finally:
         os.close(fd)
     try:
-        return max(0, int(raw.decode("ascii").strip() or "0"))
+        value = int(raw.decode("ascii").strip() or "0")
     except (UnicodeDecodeError, ValueError):
-        return 0
+        return None
+    return value if value >= 0 else None
 
 
 def _write_seen(stamp_ms: int) -> int:
@@ -460,11 +468,15 @@ def _write_seen(stamp_ms: int) -> int:
 
 
 def _screenshot_stamps() -> tuple[str, list[tuple[int, str]]]:
-    """(directory, [(mtime_ms, name)]) newest first, cheap enough to poll.
+    """(directory, [(mtime_ms, name)]) newest first.
 
-    Deliberately lighter than `list`: names and stat only, no PNG headers read
-    and no preview cache touched, because the bar asks this question on a timer
-    and the answer is one number.
+    Lighter than `list` in that it materializes no preview and hashes nothing,
+    but it admits exactly the same files, by calling the same opener. A cheaper
+    check that skipped the PNG header would count screenshots the panel then
+    refuses to show — the bar would report one waiting and the list would open
+    empty — and would contradict the README's promise that over-limit images
+    are ignored. The header is 24 bytes at a known offset; correctness is worth
+    the read.
     """
     directory = screenshots_dir()
     directory_fd = _open_directory(directory)
@@ -474,12 +486,11 @@ def _screenshot_stamps() -> tuple[str, list[tuple[int, str]]]:
             if not SCREENSHOT_NAME_RE.fullmatch(name):
                 continue
             try:
-                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError:
+                screenshot = _open_screenshot_at(directory_fd, directory, name)
+            except ScreenshotError:
                 continue
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_FILE_BYTES:
-                continue
-            stamps.append((metadata.st_mtime_ns // 1_000_000, name))
+            stamps.append((screenshot.mtime_ns // 1_000_000, name))
+            os.close(screenshot.fd)
     finally:
         os.close(directory_fd)
     stamps.sort(reverse=True)
@@ -495,7 +506,11 @@ def status(*, mark_seen: bool = False) -> dict[str, object]:
     # Nothing on disk when the widget is first enabled is "new": it all predates
     # the marker existing. Starting the marker at zero would light the bar up on
     # first run for a directory the user has never once thought of as unread.
-    if seen_ms <= 0 or mark_seen:
+    #
+    # `is None` rather than `<= 0`: an empty directory legitimately records a
+    # marker of zero, and that zero must be kept, or the first screenshot to
+    # arrive would be treated as another cold start and silently marked seen.
+    if seen_ms is None or mark_seen:
         seen_ms = _write_seen(latest_ms)
 
     return {

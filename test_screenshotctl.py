@@ -156,6 +156,49 @@ class ScreenshotCtlTests(unittest.TestCase):
         self.assertEqual(state["total"], 0)
         self.assertEqual(state["latest"], "")
 
+    def test_first_screenshot_in_an_empty_folder_counts_as_new(self) -> None:
+        # The case the marker's zero exists for. An empty directory records a
+        # seen stamp of zero, and that zero has to be told apart from having no
+        # marker at all — otherwise the first screenshot to land looks like
+        # another cold start and is marked seen without ever being announced.
+        state = screenshotctl.status()
+        self.assertEqual(state["total"], 0)
+        self.assertEqual(state["seenStamp"], 0)
+        marker = self.state / "omarchy" / "screenshot-manager" / "seen"
+        self.assertEqual(marker.read_text(), "0")
+
+        self.write_png("screenshot-first.png")
+
+        state = screenshotctl.status()
+        self.assertEqual(state["newCount"], 1)
+        self.assertEqual(state["total"], 1)
+
+    def test_second_screenshot_after_the_first_is_seen(self) -> None:
+        screenshotctl.status()
+        self.write_png("screenshot-first.png")
+        self.assertEqual(screenshotctl.status()["newCount"], 1)
+        screenshotctl.status(mark_seen=True)
+
+        self.age(self.write_png("screenshot-second.png"), 60)
+
+        self.assertEqual(screenshotctl.status()["newCount"], 1)
+
+    def test_status_ignores_images_the_panel_would_refuse(self) -> None:
+        # `status` and `list` must admit the same files: a screenshot counted on
+        # the bar but rejected by the panel is a bar that says one is waiting
+        # and a list that opens empty.
+        self.write_png("screenshot-huge.png", 10_000, 10_000)
+        oversize = self.pictures / "screenshot-oversize.png"
+        with oversize.open("wb") as handle:
+            handle.write(png_header())
+            handle.truncate(screenshotctl.MAX_FILE_BYTES + 1)
+
+        state = screenshotctl.status()
+
+        self.assertEqual(state["total"], 0)
+        self.assertEqual(state["newCount"], 0)
+        self.assertEqual(state["total"], screenshotctl.list_screenshots()["total"])
+
     def test_status_survives_an_unreadable_marker(self) -> None:
         self.write_png("screenshot-old.png")
         marker = self.state / "omarchy" / "screenshot-manager"

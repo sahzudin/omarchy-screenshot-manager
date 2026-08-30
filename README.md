@@ -98,7 +98,14 @@ the panel.
 The marker lives in `~/.local/state/omarchy/screenshot-manager/seen`, so what
 you have already seen survives a shell restart. Switching the setting on for the
 first time starts the marker at the newest screenshot already on disk: a folder
-you have had for months does not count as new.
+you have had for months does not count as new. An empty folder records a marker
+of zero, which is a marker like any other — the first screenshot to arrive is
+announced rather than swallowed as another cold start.
+
+The bar and the panel admit exactly the same files: anything the panel would
+refuse — a symlink, a non-regular file, an over-limit PNG — is not counted on
+the bar either, so the glyph never reports one waiting that the list cannot
+show.
 
 Detection is a directory scan (`screenshotctl.py status` — names and `stat`
 only, no image data read and no preview cache touched) every 5 seconds, run once

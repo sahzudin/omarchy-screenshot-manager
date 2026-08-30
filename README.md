@@ -17,6 +17,8 @@ deleting screenshots taken with `omarchy capture screenshot`.
 - Opens the screenshots folder in the file manager.
 - Text filter to narrow the list by filename or date.
 - Auto-refreshes while the panel is open.
+- Optionally colours the bar icon in the theme accent when a screenshot has
+  been taken that you have not looked at yet, and drops it back on click.
 - Supports shell IPC (`open`, `close`, `toggle`, `show`, `hide`, and `refresh`).
 
 No privileges are required: screenshots are ordinary user files. Paths are
@@ -76,12 +78,39 @@ under `bar.layout.<section>`:
 ```jsonc
 {
   "id": "io.github.sahzudin.omarchy-screenshot-manager",
-  "icon": "󰄀",        // any Nerd Font glyph; default is md-camera
-  "showCount": true   // set false to hide the screenshot count on the bar
+  "icon": "󰄀",            // any Nerd Font glyph; default is md-camera
+  "showCount": true,      // set false to hide the screenshot count on the bar
+  "highlightNew": false   // set true to accent the icon when a screenshot is new
 }
 ```
 
 The file hot-reloads on save.
+
+### Highlighting new screenshots
+
+With `highlightNew` on, the bar icon is drawn in the theme accent colour once a
+screenshot exists that you have not opened the manager for. Nothing is added
+beside the glyph — the glyph itself is recoloured, the same way the shell's own
+bar indicators say a thing wants you — so the row of icons keeps its shape.
+Clicking the widget clears it, whichever button you click, and so does closing
+the panel.
+
+The marker lives in `~/.local/state/omarchy/screenshot-manager/seen`, so what
+you have already seen survives a shell restart. Switching the setting on for the
+first time starts the marker at the newest screenshot already on disk: a folder
+you have had for months does not count as new. An empty folder records a marker
+of zero, which is a marker like any other — the first screenshot to arrive is
+announced rather than swallowed as another cold start.
+
+The bar and the panel admit exactly the same files: anything the panel would
+refuse — a symlink, a non-regular file, an over-limit PNG — is not counted on
+the bar either, so the glyph never reports one waiting that the list cannot
+show.
+
+Detection is a directory scan (`screenshotctl.py status` — names and `stat`
+only, no image data read and no preview cache touched) every 5 seconds, run once
+per shell rather than once per monitor. It is off by default and the timer does
+not run at all until you switch it on.
 
 ## Remove
 

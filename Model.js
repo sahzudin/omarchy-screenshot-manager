@@ -61,6 +61,51 @@ function parseState(raw) {
   }
 }
 
+function emptyStatus() {
+  return {
+    known: false,
+    total: 0,
+    latestStamp: 0,
+    seenStamp: 0,
+    newCount: 0
+  }
+}
+
+function parseStatus(raw) {
+  try {
+    var parsed = JSON.parse(String(raw || "{}"))
+    return {
+      known: true,
+      total: Math.max(0, Number(parsed.total || 0)),
+      latestStamp: Number(parsed.latestStamp || 0),
+      seenStamp: Number(parsed.seenStamp || 0),
+      newCount: Math.max(0, Number(parsed.newCount || 0))
+    }
+  } catch (error) {
+    return emptyStatus()
+  }
+}
+
+// The state a click produces, applied before the helper has run so the glyph
+// drops back to the bar foreground on the press rather than a round-trip later.
+function seenStatus(status) {
+  var value = status || emptyStatus()
+  return {
+    known: value.known,
+    total: value.total,
+    latestStamp: value.latestStamp,
+    seenStamp: value.latestStamp,
+    newCount: 0
+  }
+}
+
+// The script lives beside this file; QML hands out a file:// URL and Process
+// wants a path.
+function scriptPath(url) {
+  var value = decodeURIComponent(String(url || ""))
+  return value.indexOf("file://") === 0 ? value.substring(7) : value
+}
+
 function defaultIcon() {
   return "󰄀"
 }
@@ -70,6 +115,15 @@ function barLabel(count, vertical, known, icon, showCount) {
   if (!known || Number(count || 0) === 0) return glyph
   if (showCount === false) return glyph
   return vertical ? glyph + "\n" + count : glyph + " " + count
+}
+
+var BAR_HINT = "left: manage · right: new · middle: copy latest"
+
+function barTooltip(newCount) {
+  var count = Math.max(0, Number(newCount || 0))
+  if (count === 1) return "1 new screenshot · " + BAR_HINT
+  if (count > 1) return count + " new screenshots · " + BAR_HINT
+  return "Screenshots · " + BAR_HINT
 }
 
 function screenshotKey(screenshot) {

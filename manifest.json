@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.sahzudin.omarchy-screenshot-manager",
   "name": "Omarchy Screenshot Manager",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "author": "Sahzudin Mahmic",
   "license": "MIT",
   "description": "Browse, preview, copy, and delete screenshots taken with omarchy capture.",
@@ -19,11 +19,30 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "showCount": true
+      "showCount": true,
+      "highlightNew": false
     },
     "schema": [
-      { "key": "showCount", "type": "boolean", "label": "Show screenshot count", "defaultValue": true },
-      { "key": "icon", "type": "string", "label": "Bar icon (Nerd Font glyph)", "defaultValue": "󰄀" }
+      {
+        "key": "showCount",
+        "type": "boolean",
+        "label": "Show screenshot count",
+        "defaultValue": true,
+        "description": "The number of screenshots, beside the camera. Off leaves the glyph alone, which is the version to run when the folder is somewhere you pass through rather than somewhere you keep count of."
+      },
+      {
+        "key": "highlightNew",
+        "type": "boolean",
+        "label": "Highlight new screenshots",
+        "defaultValue": false,
+        "description": "Colours the camera in the theme accent once a screenshot has been taken that you have not opened the manager for, and drops it back the moment you click it. Nothing is added beside the glyph, so the row of icons stays the shape it was. Off by default because it costs a small directory scan every few seconds; nothing runs at all until you switch it on."
+      },
+      {
+        "key": "icon",
+        "type": "string",
+        "label": "Bar icon (Nerd Font glyph)",
+        "defaultValue": "󰄀"
+      }
     ]
   }
 }
